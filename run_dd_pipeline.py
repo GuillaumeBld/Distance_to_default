@@ -460,17 +460,18 @@ def calculate_returns(prices_df, min_observations=50):
     
     return returns_df
 
-def calculate_volatility(returns_df, min_observations=50):
+def calculate_volatility(returns_df, min_observations=50, trading_days_param=TRADING_DAYS):
     """Calculate annualized volatility from daily returns.
     
     Args:
         returns_df: DataFrame of daily returns
         min_observations: Minimum number of observations required
+        trading_days_param: Number of trading days in a year for annualization.
         
     Returns:
         Series of annualized volatilities with NaN for insufficient data
     """
-    logger.info("Calculating annualized volatilities")
+    logger.info(f"Calculating annualized volatilities using {trading_days_param} trading days.")
     
     # Count valid observations per column
     valid_obs = returns_df.count()
@@ -484,7 +485,7 @@ def calculate_volatility(returns_df, min_observations=50):
     # Calculate standard deviation and annualize only for valid series
     daily_vol = returns_df.std()
     daily_vol[insufficient_data] = np.nan  # Set NaN for insufficient data
-    annual_vol = daily_vol * np.sqrt(TRADING_DAYS)
+    annual_vol = daily_vol * np.sqrt(trading_days_param)
     
     return annual_vol
 
@@ -522,61 +523,154 @@ def kmv_equation(vars_, E, D, r, sigma_E, T=1.0):
         return [np.nan, np.nan]
 
 def calculate_kmv_metrics(E, D, r, sigma_E, T=1.0):
-    """Calculate KMV metrics using numerical optimization.
+    """Calculate KMV metrics using an iterative numerical optimization.
     
+    This function implements an iterative procedure to solve for asset value (V_A)
+    and asset volatility (sigma_A) based on the Merton model.
+
     Args:
-        E: Market value of equity
-        D: Face value of debt
-        r: Risk-free rate (annualized)
-        sigma_E: Equity volatility (annualized)
-        T: Time horizon in years (default: 1 year)
+        E: Market value of equity.
+        D: Face value of debt.
+        r: Risk-free rate (annualized).
+        sigma_E: Equity volatility (annualized, from market data).
+        T: Time horizon in years (default: 1 year).
         
     Returns:
-        Tuple of (V_asset, sigma_A, DD, PD, converged)
+        Tuple of (V_asset, sigma_A, DD, PD, converged_status)
     """
-    try:
-        # Initial guess for asset value
-        V0 = E + D  # Initial guess: asset value = equity + debt
-        
-        # Initial guess for asset volatility with floor at 5%
-        sigma_A0 = sigma_E * (E / (E + D + 1e-10))
-        sigma_A0 = max(sigma_A0, 0.05)  # Enforce minimum 5% volatility
-        
-        # Solve the system of equations with full output
-        solution, infodict, ier, msg = fsolve(
-            kmv_equation,
-            [V0, sigma_A0],
-            args=(E, D, r, sigma_E, T),
-            xtol=1e-8,
-            maxfev=1000,
-            full_output=1  # Return full output for convergence check
-        )
-        
-        # Check if solution converged
-        if ier != 1:
-            logger.warning(f"Solver did not converge: {msg}")
-            return np.nan, np.nan, np.nan, np.nan, False
-        
-        V_asset, sigma_A = solution
-        
-        # Ensure reasonable values
-        if V_asset <= 0 or sigma_A <= 0 or sigma_A > 5.0:  # 500% max vol
-            logger.warning(f"Unreasonable solution: V={V_asset:.2f}, σA={sigma_A:.4f}")
-            return np.nan, np.nan, np.nan, np.nan, False
-        
-        # Calculate distance to default and probability of default
-        sqrt_T = np.sqrt(T)
-        d1 = (np.log(V_asset/(D + 1e-10)) + (r + 0.5 * sigma_A**2) * T) / (sigma_A * sqrt_T + 1e-10)
-        DD = d1 - sigma_A * sqrt_T
-        PD = norm.cdf(-DD)
-        
-        return V_asset, sigma_A, DD, PD, True
-        
-    except Exception as e:
-        logger.warning(f"Error in KMV calculation: {str(e)}", exc_info=True)
+    # Ensure logger is available, even if it's just the root logger
+    # This is good practice if the function might be called from contexts where logger isn't explicitly passed
+    # However, in this script, logger is typically set up in main and available globally or passed.
+    # For this specific refactoring, assuming 'logger' is accessible as a global or module-level logger.
+    # If not, it should be passed as an argument: def calculate_kmv_metrics(E, D, r, sigma_E, T=1.0, logger=None):
+    # and then use if logger: logger.warning(...)
+    
+    # Max iterations for the outer loop and tolerance for sigma_A convergence
+    max_iterations = 100
+    tolerance = 1e-5 # Tolerance for asset volatility convergence
+    fsolve_xtol = 1e-8 # Tolerance for the inner fsolve
+    fsolve_maxfev = 500 # Max function evaluations for fsolve
+
+    # Initial guess for asset value
+    V_iter = E + D
+    if V_iter <= 0: # Handle edge case of non-positive initial asset value
+        logger.warning(f"Initial asset value V_iter = E+D = {V_iter:.2f} is non-positive. E={E}, D={D}")
         return np.nan, np.nan, np.nan, np.nan, False
 
-def process_bank_data(bank_data, returns_df, risk_free_rate, T=1.0, min_returns=50, logger=None):
+    # Initial guess for asset volatility (sigma_A_iter)
+    # Use observed equity volatility (sigma_E) to make an initial estimate for asset volatility
+    # sigma_A_iter = sigma_E * (E / (V_iter + 1e-10)) # More standard initial guess
+    sigma_A_iter = sigma_E * (E / (E + D + 1e-10)) # As per plan
+    sigma_A_iter = max(sigma_A_iter, 0.05)  # Enforce minimum 5% volatility
+    sigma_A_iter = min(sigma_A_iter, 3.0) # Enforce a reasonable maximum for initial guess (e.g. 300%)
+
+    if sigma_E <= 1e-6 : # Handle very small or zero sigma_E
+        logger.warning(f"Initial sigma_E ({sigma_E:.4f}) is very small. KMV may not be reliable.")
+        # sigma_A_iter might become very small or zero, max(..., 0.05) handles this.
+
+    converged_outer_loop = False
+    sqrt_T = np.sqrt(T)
+
+    try:
+        for i in range(max_iterations):
+            sigma_A_old = sigma_A_iter
+            
+            # Step b, c, d: Calculate d1_iter, d2_iter, E_estimated_iter
+            # These are based on the current iteration's V_iter and sigma_A_iter
+            # Add small epsilon to denominators to prevent division by zero
+            if sigma_A_iter * sqrt_T < 1e-10: # Avoid division by zero if sigma_A_iter or T is tiny
+                logger.warning(f"sigma_A_iter * sqrt_T is too small ({sigma_A_iter * sqrt_T:.2e}) in iteration {i+1}. V_iter={V_iter:.2f}, sigma_A_iter={sigma_A_iter:.4f}")
+                # This might indicate issues with inputs or convergence path
+                # Depending on desired behavior, could break or try to adjust sigma_A_iter
+                # For now, will likely lead to NaN in d1/d2 and fsolve failure or non-convergence
+                # Let fsolve handle it, or return failure if it's problematic.
+                # If d1 calculation fails, the try-except for fsolve will catch it.
+                pass # Allow to proceed, fsolve might still handle it or fail gracefully
+
+            d1_iter = (np.log(V_iter / (D + 1e-10)) + (r + 0.5 * sigma_A_iter**2) * T) / (sigma_A_iter * sqrt_T + 1e-10)
+            d2_iter = d1_iter - sigma_A_iter * sqrt_T
+            
+            # E_estimated_iter is the theoretical equity value based on V_iter and sigma_A_iter
+            E_estimated_iter = V_iter * norm.cdf(d1_iter) - D * np.exp(-r * T) * norm.cdf(d2_iter)
+            
+            if E_estimated_iter < 1e-10: # If estimated equity is near zero, sigma_E_target might blow up
+                logger.debug(f"E_estimated_iter ({E_estimated_iter:.2e}) is near zero in iteration {i+1}. V_iter={V_iter:.2f}, sigma_A_iter={sigma_A_iter:.4f}")
+                # This could lead to instability. May need to cap V_iter / (E_estimated_iter + 1e-10) or handle.
+                # For now, let it proceed, but it's a potential source of issues.
+                pass
+
+
+            # Step e: Calculate sigma_E_target_for_fsolve
+            # This is the equity volatility implied by the current V_iter and sigma_A_iter.
+            # This target sigma_E will be used in the fsolve step.
+            sigma_E_target_for_fsolve = (V_iter / (E_estimated_iter + 1e-10)) * norm.cdf(d1_iter) * sigma_A_iter
+            sigma_E_target_for_fsolve = max(sigma_E_target_for_fsolve, 1e-4) # Ensure target sigma_E is not too small
+            sigma_E_target_for_fsolve = min(sigma_E_target_for_fsolve, 5.0)  # And not excessively large
+
+            # Step f: Use fsolve to find V_new and sigma_A_new
+            # kmv_equation aims to match E (observed market equity) and sigma_E_target_for_fsolve
+            solution, infodict, ier, msg = fsolve(
+                kmv_equation,
+                [V_iter, sigma_A_iter],  # Initial guess for this fsolve step
+                args=(E, D, r, sigma_E_target_for_fsolve, T), # Note: E is market E, sigma_E is the target
+                xtol=fsolve_xtol,
+                maxfev=fsolve_maxfev,
+                full_output=1
+            )
+            
+            # Step g: Check fsolve convergence
+            if ier != 1:
+                logger.warning(f"Inner fsolve did not converge in iteration {i+1}: {msg}. V_iter={V_iter:.2f}, sigma_A_iter={sigma_A_iter:.4f}, target_sigma_E={sigma_E_target_for_fsolve:.4f}")
+                converged_outer_loop = False
+                break 
+            
+            # Step h: Update V_iter and sigma_A_iter with fsolve solution
+            V_iter, sigma_A_iter = solution[0], solution[1]
+            
+            # Basic sanity checks for V_iter and sigma_A_iter from fsolve
+            if V_iter <= 0 or sigma_A_iter <= 1e-3 or sigma_A_iter > 5.0: # Asset vol > 500% or too small
+                logger.warning(f"Unreasonable solution from fsolve in iteration {i+1}: V={V_iter:.2f}, σA={sigma_A_iter:.4f}. Breaking.")
+                converged_outer_loop = False
+                break
+            
+            # Step i: Check for outer loop convergence (based on sigma_A_iter)
+            if abs(sigma_A_iter - sigma_A_old) < tolerance:
+                converged_outer_loop = True
+                logger.debug(f"Converged in {i+1} iterations. V_A={V_iter:.2f}, sigma_A={sigma_A_iter:.4f}")
+                break
+            
+            if i == max_iterations - 1:
+                logger.warning(f"Outer loop reached max iterations ({max_iterations}) without converging. Last V={V_iter:.2f}, sigma_A={sigma_A_iter:.4f}, diff={abs(sigma_A_iter - sigma_A_old):.2e}")
+
+        # After the loop
+        if converged_outer_loop:
+            # Calculate final DD and PD using converged V_iter and sigma_A_iter
+            # Re-calculate d1 with final converged V_iter and sigma_A_iter
+            if sigma_A_iter * sqrt_T < 1e-10: # Final check before d1 calculation
+                 logger.warning(f"Final sigma_A_iter * sqrt_T is too small ({sigma_A_iter * sqrt_T:.2e}). V_iter={V_iter:.2f}, sigma_A_iter={sigma_A_iter:.4f}")
+                 return np.nan, np.nan, np.nan, np.nan, False
+
+            d1_final = (np.log(V_iter / (D + 1e-10)) + (r + 0.5 * sigma_A_iter**2) * T) / (sigma_A_iter * sqrt_T + 1e-10)
+            # DD is d2, as per the problem's implied definition (PD = N(-DD) where DD = d2)
+            DD = d1_final - sigma_A_iter * sqrt_T # This is d2
+            PD = norm.cdf(-DD) # Corresponds to N(-d2)
+            
+            # Final check for reasonable values
+            if not (np.isfinite(V_iter) and np.isfinite(sigma_A_iter) and np.isfinite(DD) and np.isfinite(PD)):
+                logger.warning(f"Final KMV results are not finite: V={V_iter}, sigma_A={sigma_A_iter}, DD={DD}, PD={PD}")
+                return np.nan, np.nan, np.nan, np.nan, False
+
+            return V_iter, sigma_A_iter, DD, PD, True
+        else:
+            # If loop broke due to fsolve failure, non-convergence, or unreasonable values
+            logger.warning(f"KMV calculation did not converge after iterations or failed. E={E:.2f}, D={D:.2f}, r={r:.4f}, input sigma_E={sigma_E:.4f}")
+            return np.nan, np.nan, np.nan, np.nan, False
+            
+    except Exception as e:
+        logger.error(f"Exception in calculate_kmv_metrics: {str(e)} for E={E}, D={D}, sigma_E={sigma_E}", exc_info=True)
+        return np.nan, np.nan, np.nan, np.nan, False
+
+def process_bank_data(bank_data, returns_df, risk_free_rate, T=1.0, min_returns=50, logger=None, trading_days_param=TRADING_DAYS):
     """Process bank data to calculate KMV metrics for each bank/date combination.
     
     Args:
@@ -586,6 +680,7 @@ def process_bank_data(bank_data, returns_df, risk_free_rate, T=1.0, min_returns=
         T: Time horizon in years (default: 1.0)
         min_returns: Minimum number of returns required for volatility calculation
         logger: Optional logger instance for logging messages
+        trading_days_param: Number of trading days in a year for annualization.
         
     Returns:
         DataFrame with KMV metrics for each bank/date combination
@@ -593,7 +688,7 @@ def process_bank_data(bank_data, returns_df, risk_free_rate, T=1.0, min_returns=
     if logger is None:
         logger = logging.getLogger(__name__)
         
-    logger.info(f"Processing KMV metrics with T={T} years")
+    logger.info(f"Processing KMV metrics with T={T} years and {trading_days_param} trading days for annualization.")
     
     # Prepare results container
     results = []
@@ -615,21 +710,57 @@ def process_bank_data(bank_data, returns_df, risk_free_rate, T=1.0, min_returns=
                 logger.warning(f"Skipping {ticker} on {date.date()}: Invalid E={E:.2f}, D={D:.2f}")
                 continue
 
-            # Calculate equity volatility (annualized)
+            # Calculate equity volatility (annualized) using a rolling window
             if ticker not in returns_df.columns:
-                logger.warning(f"No returns data for {ticker}")
+                logger.warning(f"No returns data for {ticker} in returns_df")
                 continue
+
+            # Access the full returns series for the ticker
+            ticker_returns = returns_df[ticker]
+
+            # Find the index for the current date or the closest preceding date
+            # Ensure returns_df.index is sorted (should be by design)
+            try:
+                # Get the position of the closest date <= current 'date'
+                end_idx_loc = ticker_returns.index.get_indexer([date], method='ffill')[0]
+                # Handle case where date is before the first date in returns
+                if end_idx_loc == -1 : # date is before the start of the returns series
+                    logger.warning(f"Date {date.date()} is before the start of returns data for {ticker}")
+                    continue
                 
-            returns = returns_df[ticker].dropna()
-            if len(returns) < min_returns:
-                logger.warning(f"Insufficient returns data for {ticker} on {date.date()} "
-                              f"(have {len(returns)}, need {min_returns})")
+                actual_end_date = ticker_returns.index[end_idx_loc]
+                if actual_end_date > date: # Should not happen with ffill, but as a safeguard
+                    logger.warning(f"Mismatch: Actual end date {actual_end_date.date()} for rolling window is after current date {date.date()} for {ticker}. Skipping.")
+                    continue
+
+            except KeyError: # Should not happen if returns_df.index is DatetimeIndex
+                logger.warning(f"Current date {date.date()} not found and no preceding date for {ticker} in returns data.")
                 continue
-                
-            sigma_E = returns.std() * np.sqrt(252)  # Annualize
+            except IndexError:
+                logger.warning(f"IndexError while trying to find end date for rolling window for {ticker} on {date.date()}. Skipping.")
+                continue
+
+            # Define the start index for the rolling window
+            # Window is from max(0, end_idx_loc - TRADING_DAYS + 1) to end_idx_loc + 1
+            start_idx_loc = max(0, end_idx_loc - TRADING_DAYS + 1)
             
+            # Select the returns for the rolling window
+            rolling_returns = ticker_returns.iloc[start_idx_loc : end_idx_loc + 1]
+            
+            # Check for minimum number of observations in the window
+            # Using min_returns directly as per instructions, could also use TRADING_DAYS // 2 or similar
+            if rolling_returns.count() < min_returns:
+                logger.warning(f"Insufficient returns data in rolling window for {ticker} on {date.date()} "
+                              f"(have {rolling_returns.count()}, need {min_returns}) "
+                              f"Window: {ticker_returns.index[start_idx_loc].date()} to {ticker_returns.index[end_idx_loc].date()}")
+                continue
+            
+            # Calculate annualized standard deviation
+            rolling_std = rolling_returns.std()
+            sigma_E = rolling_std * np.sqrt(trading_days_param)
+
             if sigma_E <= 0 or not np.isfinite(sigma_E):
-                logger.warning(f"Invalid sigma_E={sigma_E:.6f} for {ticker} on {date.date()}")
+                logger.warning(f"Invalid rolling sigma_E={sigma_E:.6f} for {ticker} on {date.date()} (std: {rolling_std:.6f}), using {trading_days_param} days.")
                 continue
                 
             # Calculate KMV metrics
@@ -685,18 +816,19 @@ def process_bank_data(bank_data, returns_df, risk_free_rate, T=1.0, min_returns=
     logger.info(f"Processed KMV metrics for {len(results_df)} bank/date combinations")
     return results_df
 
-def export_results(prices_df, returns_df, kmv_results, output_file, dry_run=False):
+def export_results(prices_df, returns_df, kmv_results, validation_results_df, output_file, dry_run=False):
     """Export results to Excel file with proper formatting.
     
     Args:
-        prices_df: DataFrame with daily prices
-        returns_df: DataFrame with daily returns
-        kmv_results: DataFrame with KMV metrics
-        output_file: Path to output Excel file
-        dry_run: If True, don't actually write any files
+        prices_df: DataFrame with daily prices.
+        returns_df: DataFrame with daily returns.
+        kmv_results: DataFrame with KMV metrics.
+        validation_results_df: Optional DataFrame with validation analysis results.
+        output_file: Path to output Excel file.
+        dry_run: If True, don't actually write any files.
         
     Returns:
-        bool: True if export was successful or if dry_run is True
+        bool: True if export was successful or if dry_run is True.
     """
     logger.info(f"Exporting results to {output_file}")
     
@@ -887,7 +1019,32 @@ def export_results(prices_df, returns_df, kmv_results, output_file, dry_run=Fals
             
             # Format the generated at timestamp
             worksheet.write_datetime(1, 1, datetime.now(), workbook.add_format({'num_format': 'yyyy-mm-dd hh:mm:ss'}))
-        
+
+            # Export Validation Analysis if provided
+            if validation_results_df is not None and not validation_results_df.empty:
+                validation_results_df.to_excel(writer, sheet_name='Validation_Analysis', index=False)
+                worksheet_val = writer.sheets['Validation_Analysis']
+                
+                # Format header for Validation_Analysis
+                for col_num, value in enumerate(validation_results_df.columns.values):
+                    worksheet_val.write(0, col_num, value, header_format)
+                
+                # Apply formatting to Validation_Analysis columns
+                for col_num, col_name in enumerate(validation_results_df.columns):
+                    max_len = max(validation_results_df[col_name].astype(str).map(len).max(skipna=True), len(col_name)) + 2
+                    worksheet_val.set_column(col_num, col_num, min(max_len, 30))
+
+                    if 'Date' in col_name or 'Window_Start_Actual' in col_name or 'Window_End_Actual' in col_name :
+                        worksheet_val.set_column(col_num, col_num, 12, date_fmt)
+                    elif 'PD' in col_name:
+                        worksheet_val.set_column(col_num, col_num, 15, pct_fmt)
+                    elif 'DD' in col_name:
+                         worksheet_val.set_column(col_num, col_num, 15, float_fmt)
+                    elif 'Num_Observations' in col_name or 'Window_Months_Prior' in col_name:
+                        worksheet_val.set_column(col_num, col_num, 18, int_fmt) # Integer format for counts
+            else:
+                logger.info("No validation analysis data to export or it was empty.")
+
         logger.info(f"Results successfully exported to {output_file}")
         return True
         
@@ -1273,8 +1430,155 @@ def parse_arguments():
                       help='Show version information and exit')
     exec_group.add_argument('--clean', action='store_true',
                       help='Remove temporary files and cached data before running')
+    exec_group.add_argument(
+        '--default-events-file',
+        type=str,
+        help='Optional CSV/Excel file with known default events (columns: Instrument, Default_Date)'
+    )
     
     return parser.parse_args()
+
+def validate_model_with_defaults(kmv_results_df, default_events_file_path, logger):
+    """
+    Validates the KMV model outputs against a list of known default events.
+
+    Args:
+        kmv_results_df (pd.DataFrame): DataFrame with KMV results (PD, DD).
+                                       Must contain 'Instrument', 'Date', 'Probability_of_Default', 'Distance_to_Default'.
+        default_events_file_path (str): Path to the CSV or Excel file containing default events.
+                                        Must contain 'Instrument' and 'Default_Date'.
+        logger (logging.Logger): Logger instance.
+
+    Returns:
+        pd.DataFrame: A DataFrame summarizing PD/DD trends leading up to default events,
+                      or None if validation cannot be performed.
+    """
+    if not default_events_file_path:
+        logger.info("No default events file provided. Skipping validation.")
+        return None
+
+    logger.info(f"Loading default events from: {default_events_file_path}")
+    try:
+        if default_events_file_path.lower().endswith(('.xls', '.xlsx')):
+            default_events_df = pd.read_excel(default_events_file_path)
+        elif default_events_file_path.lower().endswith('.csv'):
+            default_events_df = pd.read_csv(default_events_file_path)
+        else:
+            logger.error(f"Unsupported file format for default events: {default_events_file_path}. Please use CSV or Excel.")
+            return None
+    except FileNotFoundError:
+        logger.error(f"Default events file not found: {default_events_file_path}")
+        return None
+    except Exception as e:
+        logger.error(f"Error loading default events file {default_events_file_path}: {str(e)}")
+        return None
+
+    # Validate required columns
+    required_cols = ['Instrument', 'Default_Date']
+    if not all(col in default_events_df.columns for col in required_cols):
+        logger.error(f"Default events file must contain columns: {', '.join(required_cols)}")
+        return None
+
+    # Prepare default events data
+    try:
+        default_events_df['Default_Date'] = pd.to_datetime(default_events_df['Default_Date'])
+    except Exception as e:
+        logger.error(f"Error parsing 'Default_Date' in default events file: {str(e)}")
+        return None
+    
+    # Prepare KMV results data (ensure 'Date' is datetime)
+    if 'Date' not in kmv_results_df.columns or not pd.api.types.is_datetime64_any_dtype(kmv_results_df['Date']):
+        logger.error("'Date' column in KMV results is missing or not datetime. Cannot perform validation.")
+        return None
+    if not all(col in kmv_results_df.columns for col in ['Instrument', 'Probability_of_Default', 'Distance_to_Default']):
+        logger.error("KMV results DataFrame is missing required columns for validation: 'Instrument', 'Probability_of_Default', 'Distance_to_Default'.")
+        return None
+
+
+    # Merge KMV results with default events
+    # Ensure 'Instrument' types are compatible for merging, e.g., both strings.
+    kmv_results_df['Instrument'] = kmv_results_df['Instrument'].astype(str)
+    default_events_df['Instrument'] = default_events_df['Instrument'].astype(str)
+    
+    merged_df = pd.merge(kmv_results_df, default_events_df, on='Instrument', how='inner')
+
+    if merged_df.empty:
+        logger.warning("No common instruments found between KMV results and default events. Validation cannot proceed.")
+        return pd.DataFrame() # Return empty DataFrame
+
+    # Filter for records where KMV 'Date' is before 'Default_Date'
+    relevant_data = merged_df[merged_df['Date'] < merged_df['Default_Date']].copy() # Use .copy() to avoid SettingWithCopyWarning
+
+    if relevant_data.empty:
+        logger.info("No KMV data found prior to default dates for the matched instruments.")
+        return pd.DataFrame()
+
+    # Define time windows before default (in months)
+    windows_months = [12, 6, 3, 1] # e.g., 12 months prior, 6 months prior, etc.
+    # More precise windows: e.g. (12,9), (9,6), (6,3), (3,1) months before default
+    # For this implementation, let's consider data *within* X months of default.
+    # Example: for 12 months window, data from (Default_Date - 12 months) to Default_Date
+    
+    validation_summary = []
+
+    for instrument, group in relevant_data.groupby('Instrument'):
+        default_date = group['Default_Date'].iloc[0] # Should be the same for all rows in the group
+        
+        for months_prior in windows_months:
+            window_end_date = default_date
+            window_start_date = default_date - pd.DateOffset(months=months_prior)
+            
+            # Filter data within this specific window
+            window_data = group[
+                (group['Date'] >= window_start_date) & (group['Date'] < window_end_date)
+            ]
+            
+            if not window_data.empty:
+                avg_pd = window_data['Probability_of_Default'].mean()
+                median_pd = window_data['Probability_of_Default'].median()
+                avg_dd = window_data['Distance_to_Default'].mean()
+                median_dd = window_data['Distance_to_Default'].median()
+                num_obs = len(window_data)
+
+                validation_summary.append({
+                    'Instrument': instrument,
+                    'Default_Date': default_date,
+                    'Window_Months_Prior': months_prior, # Signifies data up to X months before default
+                    'Window_Start_Actual': window_data['Date'].min(),
+                    'Window_End_Actual': window_data['Date'].max(),
+                    'Avg_PD': avg_pd,
+                    'Median_PD': median_pd,
+                    'Avg_DD': avg_dd,
+                    'Median_DD': median_dd,
+                    'Num_Observations': num_obs
+                })
+            else:
+                 validation_summary.append({
+                    'Instrument': instrument,
+                    'Default_Date': default_date,
+                    'Window_Months_Prior': months_prior,
+                    'Window_Start_Actual': pd.NaT,
+                    'Window_End_Actual': pd.NaT,
+                    'Avg_PD': np.nan,
+                    'Median_PD': np.nan,
+                    'Avg_DD': np.nan,
+                    'Median_DD': np.nan,
+                    'Num_Observations': 0
+                })
+
+
+    if not validation_summary:
+        logger.info("No data found within any validation window for any defaulted firm.")
+        return pd.DataFrame()
+        
+    summary_df = pd.DataFrame(validation_summary)
+    
+    # Sort for better readability
+    summary_df = summary_df.sort_values(by=['Instrument', 'Default_Date', 'Window_Months_Prior'], ascending=[True, True, False])
+    
+    logger.info(f"Generated validation summary with {len(summary_df)} entries.")
+    return summary_df
+
 
 def main():
     """Main function to run the DD pipeline."""
@@ -1473,15 +1777,39 @@ def main():
             bank_data, 
             returns_df, 
             risk_free_rate, 
-            T=args.horizon,
-            min_returns=args.min_returns
+            T=1.0, # Defaulting to T=1.0 year, args.horizon was not defined
+            min_returns=args.min_returns,
+            logger=logger, # Pass the logger
+            trading_days_param=args.trading_days # Pass the command-line arg
         )
         
         if kmv_results.empty:
-            raise ValueError("No valid KMV results generated")
-            
-        logger.info(f"Successfully calculated KMV metrics for {len(kmv_results)} bank/date combinations")
-        
+            logger.warning("No valid KMV results generated. Skipping further processing.")
+            # Depending on desired behavior, might exit or continue to try to export empty/partial results
+        else:
+            logger.info(f"Successfully calculated KMV metrics for {len(kmv_results)} bank/date combinations")
+
+        # Perform model validation if default events file is provided
+        validation_summary_df = None # Initialize as None
+        if hasattr(args, 'default_events_file') and args.default_events_file:
+            if not kmv_results.empty:
+                logger.info("Performing model validation with default events...")
+                validation_summary_df = validate_model_with_defaults(
+                    kmv_results,
+                    args.default_events_file,
+                    logger
+                )
+                if validation_summary_df is not None and not validation_summary_df.empty:
+                    logger.info(f"Generated validation summary with {len(validation_summary_df)} entries.")
+                elif validation_summary_df is not None: # Empty dataframe
+                     logger.info("Validation analysis did not yield any results (e.g. no matching firms or data in windows).")
+                else: # None was returned
+                    logger.warning("Validation analysis was skipped or failed.")
+            else:
+                logger.warning("KMV results are empty, skipping validation with default events.")
+        else:
+            logger.info("No default events file specified, skipping validation step.")
+
         # Handle dry run
         if args.dry_run:
             logger.info("Dry run completed successfully (no files were written)")
@@ -1493,10 +1821,15 @@ def main():
         # Export results
         logger.info(f"Exporting results to {args.output}")
         try:
+            # Ensure kmv_results is a DataFrame even if empty for export_results consistency
+            if kmv_results is None: # Should ideally not happen if initialized properly
+                kmv_results = pd.DataFrame()
+                
             success = export_results(
                 prices_df, 
                 returns_df, 
                 kmv_results, 
+                validation_summary_df, # Pass the validation summary
                 args.output,
                 dry_run=args.dry_run
             )
