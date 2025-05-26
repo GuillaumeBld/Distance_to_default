@@ -1,63 +1,63 @@
-# Analyse du Risque Bancaire avec Scores ESG
+# Bank Risk Analysis with ESG Scores
 
-## Aperçu du Projet
-Ce projet évalue spécifiquement le risque de défaut des banques en combinant :
-- Données financières réelles
-- Scores ESG (Environnement, Social, Gouvernance)
-- Un modèle mathématique éprouvé
+## Project Overview
+This project specifically evaluates default risk for banks by combining:
+- Real financial data
+- ESG scores (Environmental, Social, Governance)
+- A proven mathematical model
 
-## Comment ça marche ?
+## How It Works
 
-### Ce que nous mesurons
-1. **Distance au Défaut** : 
-   - Indique à quel point une entreprise est proche du défaut de paiement
-   - Plus le score est élevé, plus l'entreprise est stable
+### What We Measure
+1. **Distance-to-Default**:
+   - Indicates how close a bank is to default
+   - Higher score = more stable institution
 
-2. **Probabilité de Défaut** :
-   - Traduit la Distance au Défaut en pourcentage de risque
-   - De 0% (sans risque) à 100% (défaut certain)
+2. **Probability of Default**:
+   - Converts Distance-to-Default to risk percentage
+   - From 0% (no risk) to 100% (certain default)
 
-3. **Scores ESG** :
-   - Évaluation Environnementale
-   - Performance Sociale
-   - Qualité de Gouvernance
+3. **ESG Scores**:
+   - Environmental assessment
+   - Social performance
+   - Governance quality
 
-### Analyse Spécifique aux Banques
-- **Score > 3** : Banque très stable (ex: grandes banques systémiques)
-- **Score 1-3** : Banque à surveiller (risque modéré)
-- **Score ≤ 1** : Banque en difficulté (nécessite attention immédiate)
+### Bank-Specific Analysis
+- **Score > 3**: Very stable bank (e.g., systemically important banks)
+- **Score 1-3**: Bank to monitor (moderate risk)
+- **Score ≤ 1**: Troubled bank (requires immediate attention)
 
-Les scores ESG révèlent :
-- L'impact des pratiques durables sur la stabilité bancaire
-- Les points forts/faibles (E, S ou G) spécifiques au secteur bancaire
-- La résilience face aux risques climatiques et sociaux
+ESG scores reveal:
+- How sustainable practices impact bank stability
+- Sector-specific ESG strengths/weaknesses (E, S or G)
+- Resilience to climate and social risks
 
-## Données Nécessaires
+## Required Data
 
-### Fichier d'Entrée
-Un fichier Excel contenant :
-- Les informations financières de base :
-  - Valeur des actifs
-  - Montant de la dette
-  - Cours de l'action
-- Les scores ESG :
-  - Performance environnementale
-  - Impact social
-  - Qualité de gouvernance
+### Input File
+An Excel file containing:
+- Basic financial information:
+  - Asset values
+  - Debt amounts
+  - Stock prices
+- ESG scores:
+  - Environmental performance
+  - Social impact
+  - Governance quality
 
-## Résultats Obtenus
+## Output Results
 
-Le programme génère un fichier Excel avec :
-1. Les données financières originales
-2. Les scores de risque calculés :
-   - Distance au défaut
-   - Probabilité de défaut
-3. Les scores ESG
-4. Une analyse combinée risque/ESG
+The program generates an Excel file with:
+1. Original financial data
+2. Calculated risk scores:
+   - Distance-to-Default
+   - Probability of Default
+3. ESG scores
+4. Combined risk/ESG analysis
 
-## Comment Utiliser les Résultats
+## How to Use Results
 
-### Interprétation Simple
-- Entreprise sûre : Score vert (>3)
-- Risque modéré : Score orange (1-3) 
-- Risque élevé : Score rouge (<1)
+### Simple Interpretation
+- Safe bank: Green score (>3)
+- Moderate risk: Orange score (1-3)
+- High risk: Red score (<1)
