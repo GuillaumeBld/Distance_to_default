@@ -2,7 +2,7 @@
 
 ## What Does This Tool Do?
 
-This tool helps analyze how risky banks are by looking at their financial health and sustainability practices. Think of it like a health check-up for banks that tells you:
+This tool helps analyze how risky banks are by looking at their financial health and sustainability practices. It acts as health check-up for banks that tells you:
 
 -  **Green (Safe)**: The bank is very stable and unlikely to fail
 -  **Orange (Caution)**: The bank needs monitoring but is generally okay
